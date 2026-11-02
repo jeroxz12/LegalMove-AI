@@ -1,0 +1,12 @@
+openai==3.41.0
+langchain-core==1.7.3
+langchain-openai==1.7.3
+langfuse==5.0.4
+pydantic==2.14.2
+python-dotenv==1.2.4
+
+# Pruebas
+pytest==9.2.0
+
+# Generación de imágenes de prueba (scripts/render_test_pair.py)
+pillow==12.3.0
