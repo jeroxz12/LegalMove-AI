@@ -118,6 +118,7 @@ contract-analysis                       input: nombres de archivo · output: JSO
 - Si una etapa falla, su span y el raíz quedan con nivel `ERROR` y el mensaje del error.
 - La observabilidad está aislada del análisis (`src/tracing.py`): si Langfuse falla al crear o actualizar un span, o al enviar la traza, el análisis sigue, su error nunca se reemplaza y el JSON válido se conserva.
 - Las fallas de envío se detectan con un handler de logging sobre los loggers de Langfuse y OpenTelemetry (exit 5).
+- Langfuse calcula el costo de cada generación a partir de los tokens. Una ejecución cuesta unos USD 0,02 con 4 generaciones y tarda entre 10 y 16 s. Medido el 02/11/2026: par 2, USD 0,022 en 15,6 s; caso sin cambios, USD 0,021 en 10,3 s.
 
 ## Pruebas
 
