@@ -1,5 +1,6 @@
 import json
 import logging
+from contextlib import nullcontext
 
 import httpx2
 import pytest
@@ -7,6 +8,7 @@ from langfuse import Langfuse
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from src import main as cli
+from src import tracing
 from src.config import load_settings
 from src.errors import (
     AgentError,
@@ -38,13 +40,13 @@ RESULT = ContractChangeOutput(
 ENV = {"OPENAI_API_KEY": "sk-test", "OPENAI_MAX_RETRIES": "0", "OPENAI_TIMEOUT_SECONDS": "5"}
 
 
-def completion(content):
+def completion(content, finish_reason="stop"):
     return {
         "id": "chatcmpl-test",
         "object": "chat.completion",
         "created": 0,
         "model": "gpt-4o",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": finish_reason}],
         "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
     }
 
@@ -52,8 +54,9 @@ def completion(content):
 class FakeOpenAI:
     """Responde como OpenAI según el tipo de llamada: Vision, mapa contextual o extracción."""
 
-    def __init__(self, context_map=CONTEXT_MAP):
+    def __init__(self, context_map=CONTEXT_MAP, extraction=None):
         self.context_map = context_map
+        self.extraction = extraction or completion(RESULT.model_dump_json())
         self.calls = []
 
     def __call__(self, request):
@@ -63,7 +66,7 @@ class FakeOpenAI:
             return httpx2.Response(200, json=completion("# CONTRATO\n\n## 3. Precio\nUSD 1.200"))
         if "response_format" in body:
             self.calls.append("extraction")
-            return httpx2.Response(200, json=completion(RESULT.model_dump_json()))
+            return httpx2.Response(200, json=self.extraction)
         self.calls.append("contextualization")
         return httpx2.Response(200, json=completion(self.context_map))
 
@@ -226,8 +229,8 @@ def test_tracing_failure_keeps_the_json_and_exits_5(monkeypatch, capsys):
     out, err = capsys.readouterr()
     assert ContractChangeOutput.model_validate_json(out) == RESULT
     assert "AVISO" in err and "Langfuse" in err
-    for name in cli.TRACING_LOGGERS:
-        assert not any(isinstance(h, cli._ErrorCounter) for h in logging.getLogger(name).handlers)
+    for name in tracing.TRACING_LOGGERS:
+        assert not any(isinstance(h, tracing.ErrorCounter) for h in logging.getLogger(name).handlers)
 
 
 # --- Reintentos (una sola capa, en el SDK) ---
@@ -251,3 +254,121 @@ def test_each_client_makes_three_attempts_with_two_retries():
         cli.ContextualizationAgent(llm).run("a", "b")
 
     assert attempts == {"vision": 3, "llm": 3}
+
+
+# --- Salida inválida del modelo, de punta a punta ---
+
+def use_fake_openai(monkeypatch, fake):
+    build_vision, build_llm = cli.build_vision_client, cli.build_chat_model
+    monkeypatch.setattr(cli, "build_vision_client", lambda s: build_vision(s, http_client=fake.client()))
+    monkeypatch.setattr(cli, "build_chat_model", lambda s: build_llm(s, http_client=fake.client()))
+
+
+@pytest.mark.parametrize(
+    "extraction",
+    [
+        completion(json.dumps({"sections_changed": ["Cláusula 3"], "topics_touched": ["Precio"],
+                               "summary_of_the_change": "No se detectaron cambios"})),
+        completion('{"sections_changed": ["Cláusula 3"]', finish_reason="content_filter"),
+        completion(None),
+    ],
+    ids=["contradictory", "content-filter", "empty"],
+)
+def test_unusable_extraction_exits_4_without_json(monkeypatch, capsys, extraction):
+    use_fake_openai(monkeypatch, FakeOpenAI(extraction=extraction))
+
+    assert cli.main([ORIGINAL, AMENDMENT, "--sin-trazas"]) == cli.EXIT_INVALID_ANALYSIS
+    out, err = capsys.readouterr()
+    assert out == "" and "AgentError" in err
+
+
+# --- Fallas de instrumentación: nunca reemplazan al análisis ---
+
+class BrokenLangfuse:
+    """Langfuse que falla en las operaciones indicadas."""
+
+    def __init__(self, *failures):
+        self.failures = set(failures)
+
+    def _maybe_fail(self, operation):
+        if operation in self.failures:
+            raise RuntimeError(f"langfuse falló en {operation}")
+
+    def start_as_current_observation(self, **kwargs):
+        self._maybe_fail("create")
+        return nullcontext(BrokenObservation(self))
+
+    def get_current_trace_id(self):
+        self._maybe_fail("trace_id")
+        return "a" * 32
+
+    def flush(self):
+        self._maybe_fail("flush")
+
+    def get_trace_url(self, trace_id):
+        return None
+
+
+class BrokenObservation:
+    def __init__(self, langfuse):
+        self.langfuse = langfuse
+
+    def update(self, **kwargs):
+        self.langfuse._maybe_fail("update")
+
+
+def run_with(langfuse, fake):
+    return cli.run_pipeline(
+        ORIGINAL, AMENDMENT, settings=settings(),
+        vision_client=cli.build_vision_client(settings(), http_client=fake.client()),
+        llm=cli.build_chat_model(settings(), http_client=fake.client()),
+        langfuse=langfuse,
+    )
+
+
+@pytest.mark.parametrize("failures", [("create",), ("update", "trace_id")], ids=["create", "update"])
+def test_instrumentation_failures_do_not_stop_a_valid_analysis(failures):
+    with tracing.count_tracing_errors() as errors:
+        assert run_with(BrokenLangfuse(*failures), FakeOpenAI()) == RESULT
+    assert errors.count > 0
+
+
+def test_instrumentation_failure_does_not_replace_the_analysis_error():
+    fake = FakeOpenAI(context_map=CONTEXT_MAP.replace("| AMBOS |", "| AMBIGUA |"))
+
+    with pytest.raises(AgentError, match="ambigua"):
+        run_with(BrokenLangfuse("update"), fake)
+
+
+def test_flush_failure_after_valid_analysis_keeps_json_and_exits_5(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "load_settings", lambda env, tracing_enabled: settings())
+    monkeypatch.setattr(cli, "_connect_langfuse", lambda s: BrokenLangfuse("flush"))
+    monkeypatch.setattr(cli, "run_pipeline", lambda *a, **k: RESULT)
+
+    assert cli.main([ORIGINAL, AMENDMENT]) == cli.EXIT_TRACING_FAILURE
+    out, err = capsys.readouterr()
+    assert ContractChangeOutput.model_validate_json(out) == RESULT
+    assert "AVISO" in err
+
+
+def test_analysis_error_prevails_over_flush_failure_and_both_are_reported(monkeypatch, capsys):
+    def failing_pipeline(*args, **kwargs):
+        raise AgentError("schema inválido")
+
+    monkeypatch.setattr(cli, "load_settings", lambda env, tracing_enabled: settings())
+    monkeypatch.setattr(cli, "_connect_langfuse", lambda s: BrokenLangfuse("flush"))
+    monkeypatch.setattr(cli, "run_pipeline", failing_pipeline)
+
+    assert cli.main([ORIGINAL, AMENDMENT]) == cli.EXIT_INVALID_ANALYSIS
+    out, err = capsys.readouterr()
+    assert out == "" and "schema inválido" in err and "AVISO" in err
+
+
+def test_langfuse_constructor_failure_exits_3(monkeypatch, capsys):
+    def broken_constructor(**kwargs):
+        raise ValueError("configuración de Langfuse inválida")
+
+    monkeypatch.setattr(cli, "Langfuse", broken_constructor)
+
+    assert cli._connect_langfuse(settings("pk-lf-test-constructor")) is None
+    assert "Langfuse" in capsys.readouterr().err

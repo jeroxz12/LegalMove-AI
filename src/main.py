@@ -4,11 +4,9 @@ Uso: python -m src.main <original> <adenda> [--sin-trazas]
 """
 
 import argparse
-import logging
 import os
 import sys
 from collections.abc import Callable
-from contextlib import contextmanager
 from pathlib import Path
 
 import openai
@@ -32,6 +30,14 @@ from src.errors import (
 )
 from src.image_parser import parse_contract_image, validate_image_path
 from src.models import ContractChangeOutput
+from src.tracing import (
+    count_tracing_errors,
+    current_trace_id,
+    observe,
+    report_failure,
+    safe_flush,
+    safe_update,
+)
 
 EXIT_OK = 0
 EXIT_UNEXPECTED = 1
@@ -49,9 +55,6 @@ _EXIT_CODES = {
     AgentError: EXIT_INVALID_ANALYSIS,
 }
 
-# Loggers donde Langfuse y el exportador de OpenTelemetry informan fallas de envío.
-TRACING_LOGGERS = ("langfuse", "opentelemetry.exporter.otlp.proto.http.trace_exporter")
-
 
 def run_pipeline(
     original_path: str,
@@ -67,24 +70,26 @@ def run_pipeline(
 
     `on_trace_start` recibe el `trace_id` apenas se abre la traza, para poder informarlo aunque el análisis falle.
     """
-    callbacks = [CallbackHandler(public_key=settings.langfuse_public_key)] if langfuse else None
+    callbacks = _langchain_callbacks(langfuse, settings)
     files = {"original": Path(original_path).name, "amendment": Path(amendment_path).name}
 
-    with _stage(langfuse, "contract-analysis", input=files) as root:
-        if langfuse and on_trace_start:
-            on_trace_start(langfuse.get_current_trace_id())
+    with observe(langfuse, "contract-analysis", input=files) as root:
+        if root is not None and on_trace_start:
+            trace_id = current_trace_id(langfuse)
+            if trace_id:
+                on_trace_start(trace_id)
         original_text = _parse(langfuse, "parse_original_contract", original_path, vision_client, settings)
         amendment_text = _parse(langfuse, "parse_amendment_contract", amendment_path, vision_client, settings)
 
-        with _stage(langfuse, "contextualization_agent") as span:
+        with observe(langfuse, "contextualization_agent") as span:
             context_map = ContextualizationAgent(llm).run(original_text, amendment_text, callbacks=callbacks)
-            _update(span, output=context_map)
+            safe_update(span, output=context_map)
 
-        with _stage(langfuse, "extraction_agent") as span:
+        with observe(langfuse, "extraction_agent") as span:
             result = ExtractionAgent(llm).run(context_map, original_text, amendment_text, callbacks=callbacks)
-            _update(span, output=result.model_dump())
+            safe_update(span, output=result.model_dump())
 
-        _update(root, output=result.model_dump())
+        safe_update(root, output=result.model_dump())
     return result
 
 
@@ -100,7 +105,7 @@ def main(argv: list[str] | None = None) -> int:
     if not tracing:
         _warn("modo desarrollo --sin-trazas: esta ejecución no queda registrada en Langfuse")
 
-    with _count_tracing_errors() as tracing_errors:
+    with count_tracing_errors() as tracing_errors:
         langfuse = _connect_langfuse(settings) if tracing else None
         if tracing and langfuse is None:
             return EXIT_EXTERNAL_SERVICE
@@ -128,7 +133,7 @@ def main(argv: list[str] | None = None) -> int:
             exit_code = EXIT_UNEXPECTED
         finally:
             if langfuse:
-                langfuse.flush()
+                safe_flush(langfuse)
                 if trace_ids:
                     _print_trace_reference(langfuse, trace_ids[0])
 
@@ -163,12 +168,12 @@ def build_chat_model(settings: Settings, http_client=None) -> ChatOpenAI:
 
 
 def _connect_langfuse(settings: Settings) -> Langfuse | None:
-    langfuse = Langfuse(
-        public_key=settings.langfuse_public_key,
-        secret_key=settings.langfuse_secret_key,
-        base_url=settings.langfuse_host,
-    )
     try:
+        langfuse = Langfuse(
+            public_key=settings.langfuse_public_key,
+            secret_key=settings.langfuse_secret_key,
+            base_url=settings.langfuse_host,
+        )
         authenticated = langfuse.auth_check()
     except Exception as exc:
         print(f"Langfuse no respondió o rechazó las credenciales: {type(exc).__name__}: {exc}", file=sys.stderr)
@@ -188,52 +193,20 @@ def _print_trace_reference(langfuse: Langfuse, trace_id: str) -> None:
 
 
 def _parse(langfuse, span_name: str, image_path: str, client: openai.OpenAI, settings: Settings) -> str:
-    with _stage(langfuse, span_name, input={"file_name": Path(image_path).name}) as span:
+    with observe(langfuse, span_name, input={"file_name": Path(image_path).name}) as span:
         text = parse_contract_image(image_path, client=client, model=settings.openai_model, langfuse=langfuse)
-        _update(span, output={"characters": len(text)})
+        safe_update(span, output={"characters": len(text)})
     return text
 
 
-@contextmanager
-def _stage(langfuse: Langfuse | None, name: str, **kwargs):
-    """Span de una etapa; sin Langfuse no registra nada. Si la etapa falla, queda con nivel ERROR."""
+def _langchain_callbacks(langfuse: Langfuse | None, settings: Settings) -> list[CallbackHandler] | None:
     if langfuse is None:
-        yield None
-        return
-    with langfuse.start_as_current_observation(name=name, **kwargs) as span:
-        try:
-            yield span
-        except Exception as exc:
-            span.update(level="ERROR", status_message=f"{type(exc).__name__}: {exc}")
-            raise
-
-
-def _update(span, **kwargs) -> None:
-    if span is not None:
-        span.update(**kwargs)
-
-
-class _ErrorCounter(logging.Handler):
-    def __init__(self):
-        super().__init__(level=logging.ERROR)
-        self.count = 0
-
-    def emit(self, record: logging.LogRecord) -> None:
-        self.count += 1
-
-
-@contextmanager
-def _count_tracing_errors():
-    """Cuenta los errores que Langfuse y OpenTelemetry registran durante esta ejecución."""
-    counter = _ErrorCounter()
-    loggers = [logging.getLogger(name) for name in TRACING_LOGGERS]
-    for logger in loggers:
-        logger.addHandler(counter)
+        return None
     try:
-        yield counter
-    finally:
-        for logger in loggers:
-            logger.removeHandler(counter)
+        return [CallbackHandler(public_key=settings.langfuse_public_key)]
+    except Exception as exc:
+        report_failure("no se pudo crear el callback de Langfuse", exc)
+        return None
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:

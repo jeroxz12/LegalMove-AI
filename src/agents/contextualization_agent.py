@@ -11,6 +11,8 @@ from src.errors import AgentError, ExternalServiceError
 
 AMENDMENT_TYPES = ("INSTRUCTIVA", "REESCRITA", "INDETERMINADA")
 AMBIGUOUS_MARKER = "AMBIGUA"
+CORRESPONDENCES = ("AMBOS", "SOLO_ORIGINAL", "SOLO_ADENDA", "REFERENCIADA", AMBIGUOUS_MARKER)
+TABLE_HEADER = ["ID original", "ID en adenda", "Propósito", "Correspondencia"]
 
 SYSTEM_PROMPT = """Sos un Analista Senior de contratos. Recibís la transcripción de un contrato original y la de su adenda. Tu única tarea es construir un mapa estructural comparado que otro analista usará para encontrar los cambios.
 
@@ -83,14 +85,18 @@ class ContextualizationAgent:
                 f"OpenAI falló durante la contextualización: {type(exc).__name__}: {exc}"
             ) from exc
 
-        if message.response_metadata.get("finish_reason") == "length":
+        finish_reason = message.response_metadata.get("finish_reason")
+        if finish_reason == "length":
             raise AgentError("El mapa contextual quedó incompleto: la respuesta alcanzó el límite de tokens")
+        if finish_reason != "stop":
+            raise AgentError(f"El mapa contextual no terminó normalmente (finish_reason={finish_reason!r})")
         context_map = message.text.strip()
         check_context_map(context_map)
         return context_map
 
 
 def check_context_map(context_map: str) -> None:
+    """Valida la estructura mínima que el extractor necesita; no juzga si las correspondencias son correctas."""
     if not context_map:
         raise AgentError("El agente de contextualización devolvió un mapa vacío")
 
@@ -98,15 +104,28 @@ def check_context_map(context_map: str) -> None:
     if not match or match.group(1) not in AMENDMENT_TYPES or "## Mapa de secciones" not in context_map:
         raise AgentError("El mapa contextual no respeta el formato esperado (tipo de adenda y mapa de secciones)")
 
-    ambiguous_rows = [
-        line.strip()
-        for line in context_map.splitlines()
-        if line.lstrip().startswith("|") and AMBIGUOUS_MARKER in _cells(line)
-    ]
+    rows = [_cells(line) for line in context_map.splitlines() if line.lstrip().startswith("|")]
+    if not rows or rows[0] != TABLE_HEADER:
+        raise AgentError(f"El mapa contextual no tiene la tabla esperada: | {' | '.join(TABLE_HEADER)} |")
+    data_rows = [row for row in rows[1:] if not _is_separator(row)]
+    if not data_rows:
+        raise AgentError("La tabla del mapa contextual no tiene filas")
+
+    for row in data_rows:
+        if len(row) != len(TABLE_HEADER):
+            raise AgentError(f"Fila del mapa con {len(row)} columnas en lugar de {len(TABLE_HEADER)}: {row}")
+        if row[-1] not in CORRESPONDENCES:
+            raise AgentError(f"Correspondencia desconocida en el mapa: {row[-1]!r}; se esperaba una de {CORRESPONDENCES}")
+
+    ambiguous_rows = [row for row in data_rows if row[-1] == AMBIGUOUS_MARKER]
     if ambiguous_rows:
-        rows = "\n".join(f"  {row}" for row in ambiguous_rows)
-        raise AgentError(f"Correspondencia ambigua entre secciones; no se extraen cambios:\n{rows}")
+        rows_text = "\n".join(f"  | {' | '.join(row)} |" for row in ambiguous_rows)
+        raise AgentError(f"Correspondencia ambigua entre secciones; no se extraen cambios:\n{rows_text}")
 
 
 def _cells(table_row: str) -> list[str]:
     return [cell.strip() for cell in table_row.strip().strip("|").split("|")]
+
+
+def _is_separator(row: list[str]) -> bool:
+    return all(cell and set(cell) <= set("-: ") for cell in row)

@@ -38,6 +38,8 @@ Campos de salida:
 
 Si no hay cambios: listas vacías y summary_of_the_change igual a "{NO_CHANGES_SUMMARY}"."""
 
+_EMPTY_STRUCTURED_RESPONSE = "Structured Output response does not have a 'parsed' field nor a 'refusal' field"
+
 USER_PROMPT = """<mapa_contextual>
 {context_map}
 </mapa_contextual>
@@ -76,9 +78,16 @@ class ExtractionAgent:
             raise AgentError(f"El modelo se negó a extraer los cambios: {exc}") from exc
         except openai.LengthFinishReasonError as exc:
             raise AgentError("La extracción quedó incompleta: la respuesta alcanzó el límite de tokens") from exc
+        except openai.ContentFilterFinishReasonError as exc:
+            raise AgentError("El filtro de contenido de OpenAI bloqueó la extracción") from exc
         except ValidationError as exc:
             problems = "; ".join(error["msg"] for error in exc.errors())
             raise AgentError(f"La salida del extractor no cumple ContractChangeOutput: {problems}") from exc
+        except ValueError as exc:
+            # langchain-openai 1.7.3 informa así una respuesta sin contenido ni rechazo; otros ValueError son bugs.
+            if not str(exc).startswith(_EMPTY_STRUCTURED_RESPONSE):
+                raise
+            raise AgentError("El extractor devolvió una respuesta vacía, sin JSON ni rechazo") from exc
         except openai.APIError as exc:
             raise ExternalServiceError(
                 f"OpenAI falló durante la extracción: {type(exc).__name__}: {exc}"

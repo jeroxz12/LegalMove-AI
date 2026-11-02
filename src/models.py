@@ -2,9 +2,10 @@
 
 from typing import List
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 NO_CHANGES_SUMMARY = "No se detectaron cambios"
+LABELS = ("[ADICIÓN]", "[ELIMINACIÓN]", "[MODIFICACIÓN]")
 
 
 class ContractChangeOutput(BaseModel):
@@ -41,3 +42,25 @@ class ContractChangeOutput(BaseModel):
         if repeated:
             raise ValueError(f"identificadores repetidos en sections_changed: {', '.join(repeated)}")
         return sections
+
+    @model_validator(mode="after")
+    def _fields_are_consistent(self) -> "ContractChangeOutput":
+        summary = self.summary_of_the_change.strip()
+        if not summary:
+            raise ValueError("summary_of_the_change está vacío")
+
+        if not self.sections_changed:
+            if self.topics_touched or summary != NO_CHANGES_SUMMARY:
+                raise ValueError(
+                    f'sin secciones modificadas, topics_touched debe estar vacío y el resumen ser "{NO_CHANGES_SUMMARY}"'
+                )
+            return self
+
+        if summary == NO_CHANGES_SUMMARY:
+            raise ValueError(f'hay secciones modificadas pero el resumen dice "{NO_CHANGES_SUMMARY}"')
+        if not self.topics_touched:
+            raise ValueError("hay secciones modificadas pero topics_touched está vacío")
+        unlabeled = [line for line in summary.splitlines() if line.strip() and not line.lstrip().startswith(LABELS)]
+        if unlabeled:
+            raise ValueError(f"línea del resumen sin etiqueta [ADICIÓN|ELIMINACIÓN|MODIFICACIÓN]: {unlabeled[0][:80]!r}")
+        return self

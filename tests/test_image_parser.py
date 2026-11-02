@@ -119,6 +119,21 @@ def test_file_over_size_limit_is_rejected(jpeg_file):
         validate_image_path(jpeg_file, max_bytes=10)
 
 
+@pytest.mark.parametrize("method", ["open", "stat"])
+def test_unreadable_file_is_an_input_error(monkeypatch, jpeg_file, method):
+    original = getattr(Path, method)
+
+    def failing(self, *args, **kwargs):
+        if self == jpeg_file:
+            raise PermissionError("permiso denegado")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, method, failing)
+
+    with pytest.raises(InputValidationError, match="no se pudo leer"):
+        validate_image_path(jpeg_file)
+
+
 def test_encode_returns_base64_and_mime(jpeg_file):
     image_b64, mime_type = encode_image_to_base64(jpeg_file)
 
@@ -156,6 +171,8 @@ def test_invalid_image_never_calls_the_api(tmp_path):
     [
         (chat_completion(None, refusal="No puedo ayudar."), ImageParsingError, "se negó"),
         (chat_completion("# CONTRATO\n## 1.", finish_reason="length"), ImageParsingError, "incompleta"),
+        (chat_completion("# CONTRATO\n## 1.", finish_reason="content_filter"), ImageParsingError,
+         "no terminó normalmente"),
         (chat_completion("   "), ImageParsingError, "vacía"),
         (chat_completion("## 3. Precio\nUSD [ILEGIBLE] mensuales"), IllegibleDocumentError, "1 fragmento"),
         (chat_completion("[ILEGIBLE]"), IllegibleDocumentError, "ILEGIBLE"),

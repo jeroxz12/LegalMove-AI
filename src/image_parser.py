@@ -1,19 +1,13 @@
 """Validación de imágenes de contratos y transcripción con GPT-4o Vision."""
 
 import base64
-from contextlib import nullcontext
 from pathlib import Path
 
 import openai
 from langfuse import Langfuse
 
-from src.errors import (
-    ExternalServiceError,
-    IllegibleDocumentError,
-    ImageParsingError,
-    InputValidationError,
-    LegalMoveError,
-)
+from src.errors import ExternalServiceError, IllegibleDocumentError, ImageParsingError, InputValidationError
+from src.tracing import observe, safe_update
 
 ILLEGIBLE_MARKER = "[ILEGIBLE]"
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
@@ -42,22 +36,29 @@ VISION_USER_PROMPT = "Transcribí el contrato de esta imagen."
 
 def validate_image_path(image_path: str | Path, *, max_bytes: int = MAX_IMAGE_BYTES) -> Path:
     path = Path(image_path)
-    if not path.is_file():
+    try:
+        is_file = path.is_file()
+    except OSError as exc:
+        raise InputValidationError(f"{path.name}: no se pudo leer el archivo ({type(exc).__name__})") from exc
+    if not is_file:
         raise InputValidationError(f"No existe el archivo de imagen: {path}")
 
     image_format = _FORMATS.get(path.suffix.lower())
     if image_format is None:
         raise InputValidationError(f"{path.name}: formato no admitido; se aceptan JPEG y PNG")
 
-    size = path.stat().st_size
+    mime_type, signature = image_format
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as file:
+            header = file.read(len(signature))
+    except OSError as exc:
+        raise InputValidationError(f"{path.name}: no se pudo leer el archivo ({type(exc).__name__})") from exc
+
     if size == 0:
         raise InputValidationError(f"{path.name}: el archivo está vacío")
     if size > max_bytes:
         raise InputValidationError(f"{path.name}: pesa {size} bytes y el máximo es {max_bytes}")
-
-    mime_type, signature = image_format
-    with path.open("rb") as file:
-        header = file.read(len(signature))
     if header != signature:
         raise InputValidationError(f"{path.name}: el contenido no corresponde a una imagen {mime_type}")
     return path
@@ -88,19 +89,14 @@ def parse_contract_image(
     image_b64, mime_type = encode_image_to_base64(path)
     image_info = {"file_name": path.name, "size_bytes": path.stat().st_size, "mime_type": mime_type}
 
-    observation = (
-        langfuse.start_as_current_observation(
-            name="vision-transcription",
-            as_type="generation",
-            model=model,
-            input={"system": VISION_SYSTEM_PROMPT, "user": VISION_USER_PROMPT, "image": image_info},
-            model_parameters={"temperature": 0, "max_completion_tokens": MAX_OUTPUT_TOKENS, "detail": "high"},
-        )
-        if langfuse
-        else nullcontext()
-    )
-
-    with observation as generation:
+    with observe(
+        langfuse,
+        "vision-transcription",
+        as_type="generation",
+        model=model,
+        input={"system": VISION_SYSTEM_PROMPT, "user": VISION_USER_PROMPT, "image": image_info},
+        model_parameters={"temperature": 0, "max_completion_tokens": MAX_OUTPUT_TOKENS, "detail": "high"},
+    ) as generation:
         try:
             response = client.chat.completions.create(
                 model=model,
@@ -118,24 +114,19 @@ def parse_contract_image(
                 ],
             )
         except openai.APIError as exc:
-            error = ExternalServiceError(f"OpenAI no pudo transcribir {path.name}: {type(exc).__name__}: {exc}")
-            _record_error(generation, error)
-            raise error from exc
+            raise ExternalServiceError(
+                f"OpenAI no pudo transcribir {path.name}: {type(exc).__name__}: {exc}"
+            ) from exc
 
         choice = response.choices[0]
         text = (choice.message.content or "").strip()
-        if generation:
-            generation.update(
-                output=text,
-                usage_details=_usage_details(response.usage),
-                metadata={"finish_reason": choice.finish_reason},
-            )
-
-        try:
-            _check_transcription(path.name, text, choice)
-        except LegalMoveError as error:
-            _record_error(generation, error)
-            raise
+        safe_update(
+            generation,
+            output=text,
+            usage_details=_usage_details(response.usage),
+            metadata={"finish_reason": choice.finish_reason},
+        )
+        _check_transcription(path.name, text, choice)
 
     return text
 
@@ -146,6 +137,10 @@ def _check_transcription(file_name: str, text: str, choice) -> None:
     if choice.finish_reason == "length":
         raise ImageParsingError(
             f"La transcripción de {file_name} quedó incompleta: alcanzó el límite de {MAX_OUTPUT_TOKENS} tokens"
+        )
+    if choice.finish_reason != "stop":
+        raise ImageParsingError(
+            f"La transcripción de {file_name} no terminó normalmente (finish_reason={choice.finish_reason!r})"
         )
     if not text:
         raise ImageParsingError(f"Vision devolvió una transcripción vacía para {file_name}")
@@ -161,8 +156,3 @@ def _usage_details(usage) -> dict[str, int] | None:
     if usage is None:
         return None
     return {"input": usage.prompt_tokens, "output": usage.completion_tokens, "total": usage.total_tokens}
-
-
-def _record_error(generation, error: LegalMoveError) -> None:
-    if generation:
-        generation.update(level="ERROR", status_message=str(error))

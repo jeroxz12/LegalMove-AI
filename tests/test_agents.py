@@ -91,8 +91,14 @@ def test_contextualization_returns_map_and_sends_both_texts():
         ("Las cláusulas se corresponden.", "formato esperado"),
         (CONTEXT_MAP.replace("REESCRITA", "PARCIAL"), "formato esperado"),
         (CONTEXT_MAP.replace("Precio del servicio | AMBOS", "Precio del servicio | AMBIGUA"), "Cláusula 3"),
+        ("## Tipo de adenda: REESCRITA\n## Mapa de secciones\n## Observaciones\nNinguna", "tabla esperada"),
+        (CONTEXT_MAP.split("| Cláusula 1")[0], "no tiene filas"),
+        (CONTEXT_MAP.replace("| Cláusula 1 | Cláusula 1 | Servicio prestado | AMBOS |",
+                             "| Cláusula 1 | Servicio prestado | AMBOS |"), "3 columnas"),
+        (CONTEXT_MAP.replace("Precio del servicio | AMBOS", "Precio del servicio | INCIERTA"), "desconocida"),
     ],
-    ids=["empty", "no-format", "unknown-type", "ambiguous"],
+    ids=["empty", "no-format", "unknown-type", "ambiguous", "no-table", "no-rows", "missing-column",
+         "unknown-correspondence"],
 )
 def test_invalid_context_maps_stop_the_pipeline(context_map, expected):
     with pytest.raises(AgentError, match=expected):
@@ -103,10 +109,14 @@ def test_ambiguous_word_outside_the_table_is_not_a_correspondence():
     check_context_map(CONTEXT_MAP.replace("Ninguna", "No hay filas AMBIGUA."))
 
 
-def test_truncated_context_map_is_an_agent_error():
-    fake = FakeOpenAI(completion(CONTEXT_MAP[:60], finish_reason="length"))
+@pytest.mark.parametrize(
+    ("finish_reason", "expected"),
+    [("length", "incompleto"), ("content_filter", "no terminó normalmente")],
+)
+def test_context_map_that_did_not_finish_normally_is_an_agent_error(finish_reason, expected):
+    fake = FakeOpenAI(completion(CONTEXT_MAP, finish_reason=finish_reason))
 
-    with pytest.raises(AgentError, match="incompleto"):
+    with pytest.raises(AgentError, match=expected):
         ContextualizationAgent(fake.chat_model()).run("a", "b")
 
 
@@ -147,8 +157,12 @@ def test_no_changes_output_is_valid():
         (completion(json.dumps({**EXTRACTION, "sections_changed": ["Cláusula 3", "Cláusula 3"]})),
          "repetidos en sections_changed: Cláusula 3"),
         (completion(json.dumps({"sections_changed": ["Cláusula 3"]})), "no cumple ContractChangeOutput"),
+        (completion('{"sections_changed": ["Cláusula 3"]', finish_reason="content_filter"), "filtro de contenido"),
+        (completion(None), "respuesta vacía"),
+        (completion(json.dumps({**EXTRACTION, "summary_of_the_change": "No se detectaron cambios"})),
+         "el resumen dice"),
     ],
-    ids=["refusal", "truncated", "duplicates", "schema"],
+    ids=["refusal", "truncated", "duplicates", "schema", "content-filter", "empty", "contradictory"],
 )
 def test_invalid_extractions_are_agent_errors_with_distinct_messages(response, expected):
     with pytest.raises(AgentError, match=expected):
