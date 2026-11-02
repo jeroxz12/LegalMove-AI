@@ -33,6 +33,7 @@ flowchart TD
 | `src/agents/contextualization_agent.py` | Agente 1: mapa contextual que relaciona las secciones de ambos documentos |
 | `src/agents/extraction_agent.py` | Agente 2: cambios estructurados a partir del mapa |
 | `src/models.py` | `ContractChangeOutput` |
+| `src/tracing.py` | Observabilidad aislada: una falla de Langfuse nunca reemplaza el resultado ni el error del análisis |
 | `src/config.py` / `src/errors.py` | Configuración validada y errores propios |
 
 ### Flujo y handoff entre agentes
@@ -40,7 +41,7 @@ flowchart TD
 1. **Parsing (Vision).** Cada imagen se valida (extensión, firma de bytes, tamaño), se codifica en base64 y se envía a GPT-4o con `detail: high` y `temperature=0`. El prompt pide una transcripción literal en Markdown (`#` título, `##` cláusulas), sin normalizar montos ni fechas, y marcar `[ILEGIBLE]` en lugar de adivinar.
 2. **Agente 1 — Analista Senior.** Recibe los dos textos y responde "¿dónde mirar?": clasifica la adenda (`REESCRITA`, `INSTRUCTIVA`, `INDETERMINADA`) y arma una tabla que relaciona cada cláusula por contenido y título (`AMBOS`, `SOLO_ORIGINAL`, `SOLO_ADENDA`, `REFERENCIADA`, `AMBIGUA`). No describe cambios.
 3. **Agente 2 — Auditor.** Recibe el mapa y los dos textos y responde "¿qué cambió?": compara las secciones relacionadas, etiqueta cada cambio como `[ADICIÓN]`, `[ELIMINACIÓN]` o `[MODIFICACIÓN]` y cita los valores anteriores y nuevos.
-4. **Validación.** La salida del Auditor usa structured output (`json_schema`, `strict: true`) con `ContractChangeOutput`; Pydantic valida además que no haya identificadores repetidos.
+4. **Validación.** La salida del Auditor usa structured output (`json_schema`, `strict: true`) con `ContractChangeOutput`. Pydantic valida además la coherencia entre campos: sin identificadores repetidos, resumen no vacío, cada línea con su etiqueta, y "No se detectaron cambios" solo con listas vacías. El mapa del Analista también se valida (tabla, columnas y correspondencias permitidas) antes de pasarlo al Auditor.
 
 El mapa es el contrato entre los agentes: el Auditor no rehace la correspondencia, y si el Analista marca una fila `AMBIGUA` el pipeline se detiene antes de extraer.
 
@@ -115,18 +116,19 @@ contract-analysis                       input: nombres de archivo · output: JSO
 - Vision se instrumenta con una **generación manual**: de la imagen solo se registran nombre, tamaño y MIME, nunca el base64.
 - Los agentes usan el `CallbackHandler` de Langfuse. No se usa el wrapper `langfuse.openai`, que duplicaba las generaciones y subía la imagen (verificado; ver D2 en la arquitectura).
 - Si una etapa falla, su span y el raíz quedan con nivel `ERROR` y el mensaje del error.
+- La observabilidad está aislada del análisis (`src/tracing.py`): si Langfuse falla al crear o actualizar un span, o al enviar la traza, el análisis sigue, su error nunca se reemplaza y el JSON válido se conserva.
 - Las fallas de envío se detectan con un handler de logging sobre los loggers de Langfuse y OpenTelemetry (exit 5).
 
 ## Pruebas
 
 ```bash
-pytest                    # 75 tests sin llamadas pagas ni credenciales
+pytest                    # 111 tests sin llamadas pagas ni credenciales
 pytest -m integration     # pares 3b y 1 con llamadas reales (requiere .env)
 ```
 
-Los tests habituales simulan OpenAI con un transporte HTTP en memoria (se usa `ChatOpenAI` real, así se verifica también la petición strict) y exportan los spans de Langfuse a memoria. Cubren validación de imágenes, errores de Vision, mapas inválidos o ambiguos, rechazo, truncado, duplicados, códigos de salida, jerarquía de la traza, ausencia del base64 y reintentos (3 intentos con `max_retries=2`, sin multiplicarse entre capas).
+Los tests habituales simulan OpenAI con un transporte HTTP en memoria (se usa `ChatOpenAI` real, así se verifica también la petición strict) y exportan los spans de Langfuse a memoria. Cubren validación de imágenes (incluidos archivos sin permisos), errores de Vision, mapas inválidos o ambiguos, rechazo, truncado, filtro de contenido, respuestas vacías o incoherentes, duplicados, códigos de salida, fallas de Langfuse inyectadas, jerarquía de la traza, ausencia del base64 y reintentos (3 intentos con `max_retries=2`, sin multiplicarse entre capas). `tests/conftest.py` neutraliza las variables `OTEL_*`, `LANGFUSE_*` y de proxy del entorno, para que el resultado no dependa de la máquina.
 
-Las pruebas de integración comprueban secciones, etiquetas y valores contra los hechos esperados; la redacción del resumen se revisa a mano.
+Las pruebas de integración comprueban, contra los hechos esperados, las secciones, las etiquetas por cláusula y los valores anteriores y nuevos como números completos (`tests/contract_checks.py`). Esas comprobaciones se prueban a su vez sin costo con resultados incorrectos fabricados. La redacción del resumen se revisa a mano.
 
 ## Decisiones técnicas
 

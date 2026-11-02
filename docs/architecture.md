@@ -203,11 +203,13 @@ Si el análisis falla y además falla la trazabilidad, prevalece el código del 
 | Imagen inexistente, extensión o firma inválida, vacía o demasiado grande | `InputValidationError`, exit 2, sin llamar a la API |
 | Timeout, 429, 5xx, conexión | Reintentos del SDK; si se agotan, exit 3 |
 | 401 o contexto excedido | Sin reintento, mensaje específico, exit 3 |
-| Vision vacía, rechazada o truncada (`finish_reason == "length"`, revisado a mano) | `ImageParsingError`, exit 3 |
+| Vision vacía, rechazada, truncada o con otro `finish_reason` distinto de `stop` (por ejemplo `content_filter`), revisado a mano | `ImageParsingError`, exit 3 |
+| Imagen sin permisos de lectura u otro `OSError` al validarla | `InputValidationError`, exit 2 |
 | Texto con `[ILEGIBLE]` | `IllegibleDocumentError` indicando el documento, exit 2. No se ejecutan los agentes |
-| Mapa contextual vacío o con correspondencia `AMBIGUA` | `AgentError` indicando las secciones afectadas, exit 4. No se ejecuta el extractor |
-| Rechazo del extractor, salida truncada o fuera del schema | Se registra la respuesta cruda en el span, exit 4. Son caminos distintos: el rechazo llega como `OpenAIRefusalError` (o como `parsing_error` con `include_raw=True`), la truncada como `openai.LengthFinishReasonError` aun con `include_raw=True`, y el schema inválido como error de validación |
+| Mapa contextual vacío, sin la tabla esperada, sin filas, con columnas faltantes, con una correspondencia desconocida o `AMBIGUA`, o que no terminó con `finish_reason == "stop"` | `AgentError` indicando el problema o las filas afectadas, exit 4. No se ejecuta el extractor |
+| Rechazo del extractor, salida truncada, bloqueada por el filtro de contenido, vacía o fuera del schema | `AgentError` con un mensaje distinto por caso, exit 4: `OpenAIRefusalError`, `openai.LengthFinishReasonError`, `openai.ContentFilterFinishReasonError`, el `ValueError` puntual de langchain-openai para una respuesta sin contenido, y `ValidationError`. Estas excepciones ocurren dentro de la llamada al modelo: en la traza queda el error (nivel ERROR y mensaje), no la respuesta cruda |
 | `sections_changed` con duplicados | Salida inválida con mensaje que nombra el identificador repetido, exit 4. Sin normalización ni reintento |
+| Salida incoherente: resumen vacío; secciones sin temas; secciones con el resumen "No se detectaron cambios"; sin secciones pero con temas o con un resumen distinto de "No se detectaron cambios"; una línea del resumen sin etiqueta | Validador entre campos de `ContractChangeOutput`, exit 4. Valida coherencia comprobable, no exactitud legal |
 | Falla de trazabilidad durante la ejecución o en el envío final | Ver sección 6. Si no se puede obtener la URL de la traza (`get_trace_url` consulta la API), se imprime solo el `trace_id` |
 
 Todo error capturado se registra en el span de su etapa, si la trazabilidad está disponible.
@@ -219,7 +221,7 @@ contract-analysis                (span raíz: nombres de archivo, modelo, trace_
 |-- parse_original_contract      (metadata del archivo, texto extraído, tokens, latencia)
 |-- parse_amendment_contract
 |-- contextualization_agent      (textos de entrada, context_map, tokens, latencia)
-`-- extraction_agent             (entradas, JSON validado o error + respuesta cruda, tokens, latencia)
+`-- extraction_agent             (entradas, JSON validado o error, tokens, latencia)
 ```
 
 **Qué se registra:** texto extraído de cada imagen, mapa contextual, resultado final o error, y métricas (tokens, latencia, modelo, `finish_reason`). Es lo necesario para auditar cómo se llegó al resumen.
@@ -241,7 +243,7 @@ Ningún módulo importa `langfuse.openai`: al importarse intercepta todo el SDK 
 | Momento | Ejemplo | Resultado |
 |---|---|---|
 | Chequeo inicial | Claves ausentes / credenciales rechazadas o servicio inaccesible | exit 2 / exit 3, antes de llamar a OpenAI |
-| Durante la ejecución | Error al crear un span o registrar datos | El análisis continúa; si termina válido, exit 5 |
+| Durante la ejecución | Error al crear, actualizar o cerrar un span, o al obtener el `trace_id` | `src/tracing.py` lo aísla y lo registra en el logger `legalmove.tracing`. El análisis continúa y su error, si lo hay, nunca se reemplaza. Si termina válido, exit 5 |
 | Envío final (`flush`) | Error de exportación detectado | JSON conservado en stdout, explicación en stderr, exit 5 |
 | Ninguna falla detectada | — | exit 0 |
 | `--sin-trazas` | Modo desarrollo | exit 0 si el análisis es válido, con aviso de que no hubo observabilidad |
@@ -249,8 +251,8 @@ Ningún módulo importa `langfuse.openai`: al importarse intercepta todo el SDK 
 **Cómo se detectan las fallas (comportamiento observado en la sección 10):**
 
 - **Chequeo inicial:** `auth_check()`. Una excepción o un `False` son exit 3.
-- **Durante la ejecución y en el envío final:** `flush()` devuelve `None` y no lanza excepciones aunque el envío falle. La falla solo aparece como un registro de nivel ERROR en el logger del exportador de OpenTelemetry. Para detectarla se usa un handler de `logging`:
-  - Observa los loggers `langfuse` y `opentelemetry.exporter.otlp.proto.http.trace_exporter`.
+- **Durante la ejecución y en el envío final:** `flush()` devuelve `None` y no lanza excepciones aunque el envío falle. La falla solo aparece como un registro de nivel ERROR en el logger del exportador de OpenTelemetry. Igual, `src/tracing.py` protege `flush()` y cada operación sobre spans por si alguna lanzara. Para detectarla se usa un handler de `logging`:
+  - Observa los loggers `langfuse`, `opentelemetry.exporter.otlp.proto.http.trace_exporter` y `legalmove.tracing` (fallas que el propio CLI aísla).
   - Cuenta los registros de nivel ERROR o superior. El criterio es el nombre del logger y el nivel, no el texto del mensaje. Los WARNING se ignoran: corresponden a reintentos internos del exportador.
   - Se instala al comenzar la ejecución y se retira en un bloque `finally`, después de `flush()`. Si ya hay un handler del CLI instalado, no se agrega otro. Como el CLI hace una ejecución por proceso, los errores registrados en ese intervalo pertenecen a la ejecución actual.
   - Si contó algún error y el análisis es válido: exit 5.
@@ -319,6 +321,7 @@ No se exige coincidencia literal del resumen ni se usa un LLM evaluador.
 - Comportamiento real de la API y del dashboard todavía sin evidencia (sección 10).
 - **Observado (01/11/2026):** en el par 1, el extractor junta en una sola línea `[MODIFICACIÓN]` los dos hechos de la Cláusula 1 (1.1 `ELIMINACIÓN` de "e intransferible" y 1.2 `MODIFICACIÓN`), aunque el prompt pide separarlos. La transcripción de Vision es correcta; es un límite del extractor de una sola pasada. Una regla más estricta empeoró el resultado (omitió la eliminación), así que se conservó la versión breve. Las secciones y los valores son correctos.
 - Textos completos de contratos almacenados en Langfuse.
+- Los mensajes de error de OpenAI se incluyen sin redactar en stderr y en el `status_message` de los spans. OpenAI enmascara las claves en sus errores y ningún camino agrega el base64 a un mensaje, pero no se verificó con respuestas reales de error.
 - Fallo de la API durante la defensa en vivo: conservar trazas previas como respaldo.
 
 ## 10. Verificaciones de integración
@@ -383,6 +386,7 @@ Se completa a medida que avanzan las etapas: conclusiones, versiones usadas y re
 | 02/11/2026 | 5 – CLI | `python -m src.main` con el par 3: exit 0; `["Cláusula 3", "Cláusula 4", "Cláusula 5"]` con los valores esperados y solo `[MODIFICACIÓN]`. Traza: 4 etapas hijas de `contract-analysis`, todas con output; 4 generaciones (Vision 1494 y 1508 tokens; agentes 1048 y 1547); latencia total 12,5 s; sin base64 ni adjuntos. Se detectó que `trace_context` con solo `trace_id` deja al raíz con un padre inexistente; se corrigió obteniendo el `trace_id` dentro del raíz | `trace_id` `0d15a4854dc31b3f0517918a29574981` |
 | 02/11/2026 | 6 – Traza completa | CLI con el par 1, después de la corrección: exit 0, mismas secciones y valores que en la etapa 4 (incluida la limitación de la Cláusula 1). Raíz sin padre, 4 etapas hijas, ninguna observación huérfana, 4 generaciones (2002, 1375, 1660 y 1618 tokens), todos los spans con output, latencia 12,8 s, sin imágenes | `trace_id` `0e938b6693cda674d7d4fffa269a38a6` |
 | 02/11/2026 | 7 – Integración | `pytest -m integration`: par 3b (`["Cláusula 3"]`, solo `[MODIFICACIÓN]`, 1.200 → 1.250) y par 1 (secciones y valores esperados, con `[ADICIÓN]`) pasan con llamadas reales | `tests/test_integration.py` |
+| 02/11/2026 | Revisión técnica | 8 hallazgos (1 crítico, 4 altos, 3 medios) verificados y corregidos, con tests: coherencia de la salida, filtro de contenido y respuestas vacías, aislamiento de la observabilidad, validación estructural del mapa, comprobaciones de integración más estrictas, `finish_reason` en Vision, permisos de lectura y entorno de los tests. 111 tests sin costo (también con muestreo externo al 0% y proxy inaccesible) y 2 de integración reales pasan | `tests/test_contract_checks.py`, `tests/conftest.py`, `src/tracing.py` |
 
 `spikes/check_1b_offline.py` se conserva mientras reproduzca comprobaciones que las pruebas del proyecto todavía no cubren (duplicados del wrapper, subida de imágenes, rechazo y truncado, reintentos, `flush`). Cuando los tests mantenidos lo reemplacen, se elimina; Git conserva su historial.
 
