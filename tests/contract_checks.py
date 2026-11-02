@@ -19,12 +19,14 @@ class Fact:
     labels: frozenset[str]
     numbers: frozenset[str] = field(default_factory=frozenset)
     words: tuple[str, ...] = ()
+    optional_labels: frozenset[str] = field(default_factory=frozenset)
 
 
-# Cláusula 1: tolerancia documentada (sección 9). Se acepta que la eliminación y la modificación
-# queden en una sola línea [MODIFICACIÓN], pero ambos fragmentos deben mencionarse.
+# Cláusula 1: tolerancia documentada (sección 9). [MODIFICACIÓN] es obligatoria; [ELIMINACIÓN] es
+# opcional porque el extractor puede agrupar ambos hechos en una línea, pero los dos fragmentos deben mencionarse.
 PAIR_1 = (
-    Fact(1, frozenset({"ELIMINACIÓN", "MODIFICACIÓN"}), words=("intransferible", "operaciones internas")),
+    Fact(1, frozenset({"MODIFICACIÓN"}), words=("intransferible", "operaciones internas"),
+         optional_labels=frozenset({"ELIMINACIÓN"})),
     Fact(2, frozenset({"MODIFICACIÓN"}), numbers=frozenset({"12", "24"})),
     Fact(3, frozenset({"MODIFICACIÓN"}), numbers=frozenset({"12000", "15000"})),
     Fact(4, frozenset({"MODIFICACIÓN"}), words=("chat",)),
@@ -57,8 +59,9 @@ def check_facts(output: ContractChangeOutput, facts: tuple[Fact, ...]) -> list[s
             problems.append(f"Cláusula {fact.clause}: ninguna línea en el resumen")
             continue
         labels = {_label_of(line) for line in clause_lines}
-        if not labels <= fact.labels:
-            problems.append(f"Cláusula {fact.clause}: etiquetas {sorted(labels)}, se esperaban {sorted(fact.labels)}")
+        if not fact.labels <= labels <= fact.labels | fact.optional_labels:
+            expected = sorted(fact.labels) + [f"{label} (opcional)" for label in sorted(fact.optional_labels)]
+            problems.append(f"Cláusula {fact.clause}: etiquetas {sorted(labels, key=str)}, se esperaban {expected}")
         text = " ".join(clause_lines)
         missing_numbers = fact.numbers - _numbers_in(text)
         if missing_numbers:

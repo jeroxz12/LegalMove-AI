@@ -8,10 +8,22 @@ def test_valid_output_is_accepted():
     output = ContractChangeOutput.model_validate({
         "sections_changed": ["Cláusula 3", "Cláusula 4"],
         "topics_touched": ["Precio", "Disponibilidad"],
-        "summary_of_the_change": "[MODIFICACIÓN] Cláusula 3 – Precio: de USD 1.200 a USD 1.250.",
+        "summary_of_the_change": "[MODIFICACIÓN] Cláusula 3 – Precio: de USD 1.200 a USD 1.250.\n"
+                                 "[MODIFICACIÓN] Cláusula 4 – Disponibilidad: de 99,5% a 99,9%.",
     })
 
     assert output.sections_changed == ["Cláusula 3", "Cláusula 4"]
+
+
+def test_several_changes_in_the_same_clause_are_valid():
+    output = ContractChangeOutput(
+        sections_changed=["Cláusula 1"],
+        topics_touched=["Licencia"],
+        summary_of_the_change='[ELIMINACIÓN] Cláusula 1 – Licencia: se elimina "e intransferible".\n'
+                              '[MODIFICACIÓN] Cláusula 1 – Licencia: "fines internos" pasa a "operaciones internas".',
+    )
+
+    assert output.sections_changed == ["Cláusula 1"]
 
 
 def test_duplicate_sections_are_rejected_naming_the_identifier():
@@ -54,12 +66,21 @@ def test_no_changes_output_is_valid():
           "summary_of_the_change": "No se detectaron cambios"}, "sin secciones"),
         ({"sections_changed": ["Cláusula 3"], "topics_touched": ["Precio"], "summary_of_the_change": "   "}, "vacío"),
         ({"sections_changed": ["Cláusula 3"], "topics_touched": [],
-          "summary_of_the_change": "[MODIFICACIÓN] Cláusula 3 – Precio."}, "topics_touched está vacío"),
+          "summary_of_the_change": "[MODIFICACIÓN] Cláusula 3 – Precio: sube."}, "topics_touched está vacío"),
         ({"sections_changed": ["Cláusula 3"], "topics_touched": ["Precio"],
-          "summary_of_the_change": "[MODIFICACIÓN] Cláusula 3 – Precio.\nNota: revisar."}, "sin etiqueta"),
+          "summary_of_the_change": "[MODIFICACIÓN] Cláusula 3 – Precio: sube.\nNota: revisar."}, "sin el formato"),
+        ({"sections_changed": ["Cláusula 3"], "topics_touched": ["Precio"],
+          "summary_of_the_change": "[MODIFICACIÓN] Cláusula 4 – Soporte: se agrega chat."}, "no coinciden"),
+        ({"sections_changed": ["Cláusula 3", "Cláusula 4"], "topics_touched": ["Precio"],
+          "summary_of_the_change": "[MODIFICACIÓN] Cláusula 3 – Precio: sube."}, "no coinciden"),
+        ({"sections_changed": ["Cláusula 3"], "topics_touched": ["Precio"],
+          "summary_of_the_change": "[MODIFICACIÓN]"}, "sin el formato"),
+        ({"sections_changed": ["Cláusula 3"], "topics_touched": ["Precio"],
+          "summary_of_the_change": "[MODIFICACIÓN] Cláusula 3 – Precio:"}, "sin el formato"),
     ],
     ids=["changes-but-no-changes-summary", "no-sections-but-change", "no-sections-but-topics",
-         "blank-summary", "no-topics", "unlabeled-line"],
+         "blank-summary", "no-topics", "unlabeled-line", "different-clause", "listed-without-line",
+         "label-only", "no-description"],
 )
 def test_contradictory_outputs_are_rejected(payload, expected):
     with pytest.raises(ValidationError, match=expected):

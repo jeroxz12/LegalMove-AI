@@ -15,7 +15,8 @@ SYSTEM_PROMPT = f"""Sos un Auditor de cambios contractuales. Recibís un mapa co
 Cómo trabajar:
 1. Usá el mapa para saber qué secciones se corresponden. No rehagas la correspondencia.
 2. Compará palabra por palabra cada par de secciones correspondientes. Cada diferencia de contenido es un cambio separado, aunque esté en la misma cláusula.
-3. Basate solo en el texto. No infieras cambios, no completes información ausente y no afirmes efectos legales.
+3. Después de describir una sustitución, recorré otra vez la sección original: toda palabra o calificativo que no aparece en la adenda y no forma parte de lo sustituido es una eliminación propia. No la omitas.
+4. Basate solo en el texto. No infieras cambios, no completes información ausente y no afirmes efectos legales.
 
 Etiquetá cada cambio (por cambio, no por cláusula):
 - [ADICIÓN]: nueva cláusula u obligación independiente.

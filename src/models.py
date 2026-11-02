@@ -1,11 +1,16 @@
 """Modelo de salida validado del pipeline."""
 
+import re
 from typing import List
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 NO_CHANGES_SUMMARY = "No se detectaron cambios"
-LABELS = ("[ADICIÓN]", "[ELIMINACIÓN]", "[MODIFICACIÓN]")
+
+# "[ETIQUETA] Cláusula N – Título: descripción"; el título es libre y la descripción no puede faltar.
+_SUMMARY_LINE = re.compile(
+    r"^\[(ADICIÓN|ELIMINACIÓN|MODIFICACIÓN)\]\s+(?P<section>Cláusula \d+)\b[^:]*:\s*\S"
+)
 
 
 class ContractChangeOutput(BaseModel):
@@ -60,7 +65,22 @@ class ContractChangeOutput(BaseModel):
             raise ValueError(f'hay secciones modificadas pero el resumen dice "{NO_CHANGES_SUMMARY}"')
         if not self.topics_touched:
             raise ValueError("hay secciones modificadas pero topics_touched está vacío")
-        unlabeled = [line for line in summary.splitlines() if line.strip() and not line.lstrip().startswith(LABELS)]
-        if unlabeled:
-            raise ValueError(f"línea del resumen sin etiqueta [ADICIÓN|ELIMINACIÓN|MODIFICACIÓN]: {unlabeled[0][:80]!r}")
+
+        summarized_sections = set()
+        for line in (line.strip() for line in summary.splitlines()):
+            if not line:
+                continue
+            match = _SUMMARY_LINE.match(line)
+            if not match:
+                raise ValueError(
+                    'línea del resumen sin el formato "[ETIQUETA] Cláusula N – Título: descripción": '
+                    f"{line[:80]!r}"
+                )
+            summarized_sections.add(match.group("section"))
+
+        if summarized_sections != set(self.sections_changed):
+            raise ValueError(
+                f"las cláusulas del resumen {sorted(summarized_sections)} no coinciden con "
+                f"sections_changed {sorted(self.sections_changed)}"
+            )
         return self

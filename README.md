@@ -41,7 +41,7 @@ flowchart TD
 1. **Parsing (Vision).** Cada imagen se valida (extensión, firma de bytes, tamaño), se codifica en base64 y se envía a GPT-4o con `detail: high` y `temperature=0`. El prompt pide una transcripción literal en Markdown (`#` título, `##` cláusulas), sin normalizar montos ni fechas, y marcar `[ILEGIBLE]` en lugar de adivinar.
 2. **Agente 1 — Analista Senior.** Recibe los dos textos y responde "¿dónde mirar?": clasifica la adenda (`REESCRITA`, `INSTRUCTIVA`, `INDETERMINADA`) y arma una tabla que relaciona cada cláusula por contenido y título (`AMBOS`, `SOLO_ORIGINAL`, `SOLO_ADENDA`, `REFERENCIADA`, `AMBIGUA`). No describe cambios.
 3. **Agente 2 — Auditor.** Recibe el mapa y los dos textos y responde "¿qué cambió?": compara las secciones relacionadas, etiqueta cada cambio como `[ADICIÓN]`, `[ELIMINACIÓN]` o `[MODIFICACIÓN]` y cita los valores anteriores y nuevos.
-4. **Validación.** La salida del Auditor usa structured output (`json_schema`, `strict: true`) con `ContractChangeOutput`. Pydantic valida además la coherencia entre campos: sin identificadores repetidos, resumen no vacío, cada línea con su etiqueta, y "No se detectaron cambios" solo con listas vacías. El mapa del Analista también se valida (tabla, columnas y correspondencias permitidas) antes de pasarlo al Auditor.
+4. **Validación.** La salida del Auditor usa structured output (`json_schema`, `strict: true`) con `ContractChangeOutput`. Pydantic valida además la coherencia entre campos: sin identificadores repetidos, resumen no vacío, cada línea con el formato `[ETIQUETA] Cláusula N – Título: descripción`, las mismas cláusulas en el resumen que en `sections_changed`, y "No se detectaron cambios" solo con listas vacías. El mapa del Analista también se valida (tabla, columnas y correspondencias permitidas) antes de pasarlo al Auditor.
 
 El mapa es el contrato entre los agentes: el Auditor no rehace la correspondencia, y si el Analista marca una fila `AMBIGUA` el pipeline se detiene antes de extraer.
 
@@ -122,7 +122,7 @@ contract-analysis                       input: nombres de archivo · output: JSO
 ## Pruebas
 
 ```bash
-pytest                    # 111 tests sin llamadas pagas ni credenciales
+pytest                    # 118 tests sin llamadas pagas ni credenciales
 pytest -m integration     # pares 3b y 1 con llamadas reales (requiere .env)
 ```
 
@@ -140,7 +140,7 @@ Las pruebas de integración comprueban, contra los hechos esperados, las seccion
 
 ## Limitaciones conocidas
 
-- **Par 1, Cláusula 1:** el Auditor junta en una sola línea `[MODIFICACIÓN]` la eliminación de "e intransferible" y la sustitución de "fines internos de la empresa", aunque el criterio pide separarlas. Vision transcribe bien la cláusula; las secciones y los valores son correctos.
+- **Par 1, Cláusula 1:** el Auditor junta en una sola línea `[MODIFICACIÓN]` la eliminación de "e intransferible" y la sustitución de "fines internos de la empresa", aunque el criterio pide separarlas. Vision transcribe bien la cláusula; las secciones y los valores son correctos. La salida varía entre corridas. Con el prompt anterior la eliminación llegó a omitirse; después del ajuste del prompt aparece en 3 de 3 corridas, 1 de ellas en una línea propia.
 - Una imagen por documento (sin PDF ni contratos de varias páginas).
 - La detección de `[ILEGIBLE]` depende de que el modelo use el marcador; si inventa texto, no es detectable automáticamente.
 - Renumeraciones donde un mismo número designa secciones distintas no se pueden representar con identificadores `"Cláusula N"`.

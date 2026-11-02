@@ -269,10 +269,12 @@ def use_fake_openai(monkeypatch, fake):
     [
         completion(json.dumps({"sections_changed": ["Cláusula 3"], "topics_touched": ["Precio"],
                                "summary_of_the_change": "No se detectaron cambios"})),
+        completion(json.dumps({"sections_changed": ["Cláusula 3"], "topics_touched": ["Precio"],
+                               "summary_of_the_change": "[MODIFICACIÓN] Cláusula 4 – Soporte: se agrega chat."})),
         completion('{"sections_changed": ["Cláusula 3"]', finish_reason="content_filter"),
         completion(None),
     ],
-    ids=["contradictory", "content-filter", "empty"],
+    ids=["contradictory", "sections-mismatch", "content-filter", "empty"],
 )
 def test_unusable_extraction_exits_4_without_json(monkeypatch, capsys, extraction):
     use_fake_openai(monkeypatch, FakeOpenAI(extraction=extraction))

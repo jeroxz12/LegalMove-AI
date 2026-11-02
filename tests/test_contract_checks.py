@@ -46,15 +46,20 @@ def test_clause_1_split_into_deletion_and_modification_also_passes():
          PAIR_1_SECTIONS, "faltan los valores ['12000', '15000']"),
         (replace_line(1, '[MODIFICACIÓN] Cláusula 2 – Plazo: pasa a "24 meses".'),
          PAIR_1_SECTIONS, "faltan los valores ['12']"),
-        (PAIR_1_LINES[:3] + PAIR_1_LINES[4:], PAIR_1_SECTIONS, "Cláusula 4: ninguna línea"),
+        (PAIR_1_LINES[:3] + PAIR_1_LINES[4:], [s for s in PAIR_1_SECTIONS if s != "Cláusula 4"],
+         "Cláusula 4: ninguna línea"),
         (replace_line(5, "[MODIFICACIÓN] Cláusula 7 – Protección de Datos: protección de datos."),
          PAIR_1_SECTIONS, "Cláusula 7: etiquetas ['MODIFICACIÓN']"),
         ([*PAIR_1_LINES, "[ADICIÓN] Cláusula 8 – Inventada: nueva cláusula."],
          [*PAIR_1_SECTIONS, "Cláusula 8"], "no esperada"),
         (replace_line(0, '[MODIFICACIÓN] Cláusula 1 – Licencia: pasa a "operaciones internas de negocio".'),
          PAIR_1_SECTIONS, "falta 'intransferible'"),
+        (replace_line(0, '[ELIMINACIÓN] Cláusula 1 – Licencia: se elimina "intransferible" y se mantiene '
+                         '"operaciones internas de negocio".'),
+         PAIR_1_SECTIONS, "Cláusula 1: etiquetas ['ELIMINACIÓN']"),
     ],
-    ids=["amounts-x10", "missing-old-value", "omitted-support", "wrong-label", "invented-clause", "missing-deletion"],
+    ids=["amounts-x10", "missing-old-value", "omitted-support", "wrong-label", "invented-clause", "missing-deletion",
+         "clause-1-deletion-only"],
 )
 def test_incorrect_pair_1_outputs_are_rejected(lines, sections, expected):
     problems = check_facts(output(lines, sections), PAIR_1)
